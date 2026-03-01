@@ -117,8 +117,42 @@ const injectFonts = () => {
   document.head.appendChild(style);
 };
 
+// ─── ERROR BOUNDARY ──────────────────────────────────────────────────────────
+// Catches render errors and shows a helpful screen instead of blank white page.
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error, info) {
+    console.error('[ErrorBoundary] Render crash:', error, info);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ background: '#020617', minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '2rem', textAlign: 'center' }}>
+          <div style={{ maxWidth: 480 }}>
+            <div style={{ fontSize: '4rem', marginBottom: '1.5rem' }}>⚠️</div>
+            <h2 style={{ color: '#f87171', fontFamily: 'monospace', fontSize: '1.3rem', marginBottom: '1rem' }}>Bir şeyler ters gitti</h2>
+            <pre style={{ color: 'rgba(255,255,255,0.4)', fontSize: '0.75rem', background: 'rgba(255,255,255,0.04)', padding: '1rem', borderRadius: '10px', textAlign: 'left', overflowX: 'auto', marginBottom: '1.5rem', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+              {this.state.error?.message || String(this.state.error)}
+            </pre>
+            <button onClick={() => window.location.reload()} style={{ padding: '0.75rem 2rem', background: 'rgba(0,245,255,0.15)', border: '1px solid rgba(0,245,255,0.3)', borderRadius: '12px', color: '#00f5ff', cursor: 'pointer', fontWeight: 700, fontSize: '1rem' }}>
+              Sayfayı Yenile
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 // ─── ANA COMPONENT ────────────────────────────────────────────────────────────
-export default function GizliSayiOyunu() {
+function GizliSayiOyunuInner() {
   injectFonts();
 
   // AUTH
@@ -177,30 +211,38 @@ export default function GizliSayiOyunu() {
   const isHostRef = useRef(isHost);
   const myRoomIdRef = useRef(myRoomId);
   const authUserRef = useRef(authUser);
+  const currentRoomRef = useRef(currentRoom); // FIX: accessed in async clickNumber
 
-  // Keep refs in sync with state on every render
+  // Keep refs in sync with state on every render (runs synchronously each render)
   screenRef.current = screen;
   gameStateRef.current = gameState;
   playersRef.current = players;
   isHostRef.current = isHost;
   myRoomIdRef.current = myRoomId;
   authUserRef.current = authUser;
+  currentRoomRef.current = currentRoom;
 
   // ── AUTH LISTENER ─────────────────────────────────────────────────────────
+  // CRITICAL FIX: Only navigate on FIRST auth check (initial page load).
+  // Firebase re-fires onAuthStateChanged on token refresh / reconnect.
+  // If we blindly setScreen('home') every time, mid-game players get booted out.
+  const initialAuthDone = useRef(false);
   useEffect(() => {
     const off = onAuthStateChanged(auth, async (user) => {
+      const isFirst = !initialAuthDone.current;
+      initialAuthDone.current = true;
       setAuthUser(user);
       if (user) {
         const snap = await getDoc(doc(db, 'users', user.uid));
         if (snap.exists()) {
           setUserProfile(snap.data());
-          setScreen('home');
+          if (isFirst) setScreen('home');
         } else {
-          setScreen('auth');
+          if (isFirst) setScreen('auth');
         }
       } else {
         setUserProfile(null);
-        setScreen('landing');
+        if (isFirst) setScreen('landing');
       }
       setAuthLoading(false);
     });
@@ -403,8 +445,11 @@ export default function GizliSayiOyunu() {
     const pl = playersRef.current;
     const rid = myRoomIdRef.current;
     const uid_me = authUserRef.current?.uid;
-    if (!gs || !pl.length || !rid || !uid_me) return;
-    if (!gs.turnOrder || gs.turnOrder[gs.turnIndex] !== uid_me) return;
+    const room = currentRoomRef.current; // Use ref, not closure
+    if (!gs || !pl.length || !rid || !uid_me || !room) return;
+    if (!gs.turnOrder || !gs.turnOrder.length) return;
+    if (gs.turnOrder[gs.turnIndex] !== uid_me) return;
+    try {
 
     const allSecretsSnap = await getDocs(collection(db, `rooms/${rid}/secrets`));
     const secretsMap = {};
@@ -434,7 +479,7 @@ export default function GizliSayiOyunu() {
     }
 
     const clickedSoFar = [...(gs.clickedNumbers || []), num];
-    const unclicked = Array.from({ length: currentRoom.maxNumber }, (_, i) => i + 1)
+    const unclicked = Array.from({ length: room.maxNumber }, (_, i) => i + 1)
       .filter(n => !clickedSoFar.includes(n));
 
     let nextIdx = (gs.turnIndex + 1) % gs.turnOrder.length;
@@ -460,23 +505,31 @@ export default function GizliSayiOyunu() {
       'gameState.phase': isEnd ? 'finished' : 'playing',
       players: newPlayers
     });
+    } catch (err) {
+      console.error('[clickNumber] Error:', err);
+      // Don't crash — game continues
+    }
   };
 
   const applyTimeoutPenalty = async () => {
-    // Use refs — guaranteed fresh values, no stale closure
     const gs = gameStateRef.current;
     const pl = playersRef.current;
     const rid = myRoomIdRef.current;
     if (!gs || !pl.length || !rid) return;
-    const curId = gs.turnOrder[gs.turnIndex];
-    const newP = pl.map(p => p.id === curId ? { ...p, score: p.score - 20 } : p);
-    let nextIdx = (gs.turnIndex + 1) % gs.turnOrder.length;
-    let s = 0;
-    while (gs.foundPlayers.includes(gs.turnOrder[nextIdx]) && s++ < pl.length)
-      nextIdx = (nextIdx + 1) % gs.turnOrder.length;
-    await updateDoc(doc(db, 'rooms', rid), {
-      players: newP, 'gameState.turnIndex': nextIdx, 'gameState.turnStartTime': Date.now()
-    });
+    if (!gs.turnOrder || !gs.turnOrder.length) return;
+    try {
+      const curId = gs.turnOrder[gs.turnIndex];
+      const newP = pl.map(p => p.id === curId ? { ...p, score: p.score - 20 } : p);
+      let nextIdx = (gs.turnIndex + 1) % gs.turnOrder.length;
+      let s = 0;
+      while (gs.foundPlayers.includes(gs.turnOrder[nextIdx]) && s++ < pl.length)
+        nextIdx = (nextIdx + 1) % gs.turnOrder.length;
+      await updateDoc(doc(db, 'rooms', rid), {
+        players: newP, 'gameState.turnIndex': nextIdx, 'gameState.turnStartTime': Date.now()
+      });
+    } catch (err) {
+      console.error('[applyTimeoutPenalty] Error:', err);
+    }
     timerLockRef.current = false;
   };
 
@@ -1147,6 +1200,15 @@ export default function GizliSayiOyunu() {
   );
 
   return null;
+}
+
+// ─── WRAPPER WITH ERROR BOUNDARY ─────────────────────────────────────────────
+export default function GizliSayiOyunu() {
+  return (
+    <ErrorBoundary>
+      <GizliSayiOyunuInner />
+    </ErrorBoundary>
+  );
 }
 
 // ─── STYLE HELPERS ────────────────────────────────────────────────────────────
