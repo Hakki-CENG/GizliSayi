@@ -170,6 +170,22 @@ export default function GizliSayiOyunu() {
   const unsub = useRef(() => {});
   const queueUnsub = useRef(() => {});
 
+  // ── CRITICAL: Refs to avoid stale closures in async callbacks ─────────────
+  const screenRef = useRef(screen);
+  const gameStateRef = useRef(gameState);
+  const playersRef = useRef(players);
+  const isHostRef = useRef(isHost);
+  const myRoomIdRef = useRef(myRoomId);
+  const authUserRef = useRef(authUser);
+
+  // Keep refs in sync with state on every render
+  screenRef.current = screen;
+  gameStateRef.current = gameState;
+  playersRef.current = players;
+  isHostRef.current = isHost;
+  myRoomIdRef.current = myRoomId;
+  authUserRef.current = authUser;
+
   // ── AUTH LISTENER ─────────────────────────────────────────────────────────
   useEffect(() => {
     const off = onAuthStateChanged(auth, async (user) => {
@@ -192,32 +208,60 @@ export default function GizliSayiOyunu() {
   }, []);
 
   // ── ROOM LISTENER ─────────────────────────────────────────────────────────
+  // FIX: screen is NOT a dependency — we use screenRef.current inside the callback.
+  // This prevents the listener from being torn down/rebuilt on every screen change,
+  // which was causing race conditions and missed snapshots → white screen.
   useEffect(() => {
     unsub.current();
-    if (!myRoomId || !(['lobby', 'game', 'selectNumber', 'results'].includes(screen))) {
-      unsub.current = () => {};
-      return;
-    }
+    unsub.current = () => {};
+    if (!myRoomId) return;
+
     unsub.current = onSnapshot(doc(db, 'rooms', myRoomId), (snap) => {
       if (!snap.exists()) return;
       const data = snap.data();
-      setCurrentRoom(data);
-      setPlayers(data.players || []);
-      setGameState(data.gameState);
-      if (data.host === authUser?.uid) setIsHost(true);
 
-      const phase = data.gameState?.phase;
-      if (phase === 'selectingNumbers' && (screen === 'lobby' || screen === 'results')) {
+      // Normalize all arrays to prevent undefined crashes during render
+      const safeGameState = data.gameState ? {
+        phase: data.gameState.phase || 'lobby',
+        turnOrder: data.gameState.turnOrder || [],
+        turnIndex: data.gameState.turnIndex ?? 0,
+        turnStartTime: data.gameState.turnStartTime || 0,
+        clickedNumbers: data.gameState.clickedNumbers || [],
+        foundPlayers: data.gameState.foundPlayers || [],
+      } : null;
+
+      const safePlayers = (data.players || []).map(p => ({
+        id: p.id || '',
+        name: p.name || '?',
+        score: p.score ?? 0,
+        isHost: p.isHost || false,
+        hasSelectedNumber: p.hasSelectedNumber || false,
+      }));
+
+      // Batch all state updates together to prevent split renders
+      setCurrentRoom(data);
+      setPlayers(safePlayers);
+      setGameState(safeGameState);
+      if (data.host === authUserRef.current?.uid) setIsHost(true);
+
+      // Use screenRef.current — always fresh, never stale
+      const curScreen = screenRef.current;
+      const phase = safeGameState?.phase;
+
+      if (phase === 'selectingNumbers' && (curScreen === 'lobby' || curScreen === 'results')) {
         setSecretNumber(null);
         setScreen('selectNumber');
       }
-      if (phase === 'playing' && screen === 'selectNumber') setScreen('game');
-      if (phase === 'finished' && screen === 'game') {
+      if (phase === 'playing' && curScreen === 'selectNumber') {
+        setScreen('game');
+      }
+      if (phase === 'finished' && curScreen === 'game') {
         setTimeout(() => setScreen('results'), 3200);
       }
     });
+
     return () => unsub.current();
-  }, [myRoomId, screen, authUser?.uid]);
+  }, [myRoomId]); // Only re-subscribe if the room changes, NOT on screen change
 
   // ── TIMER (FIXED) ─────────────────────────────────────────────────────────
   useEffect(() => {
@@ -225,22 +269,22 @@ export default function GizliSayiOyunu() {
     timerLockRef.current = false;
     if (gameState?.phase !== 'playing' || screen !== 'game') return;
 
+    const capturedStartTime = gameState.turnStartTime; // capture at effect run time
+
     const tick = () => {
-      const startTime = gameState.turnStartTime;
-      if (!startTime || startTime <= 0) { setTimeLeft(TURN_TIME); return; }
-      const elapsed = Date.now() - startTime;
-      // clamp strictly between 0 and TURN_TIME
+      if (!capturedStartTime || capturedStartTime <= 0) { setTimeLeft(TURN_TIME); return; }
+      const elapsed = Date.now() - capturedStartTime;
       const remaining = Math.max(0, Math.min(TURN_TIME, Math.ceil((TURN_TIME * 1000 - elapsed) / 1000)));
       setTimeLeft(remaining);
-      if (remaining === 0 && isHost && !timerLockRef.current) {
+      if (remaining === 0 && isHostRef.current && !timerLockRef.current) {
         timerLockRef.current = true;
-        applyTimeoutPenalty();
+        applyTimeoutPenalty(); // uses refs internally — always fresh
       }
     };
     tick();
     timerRef.current = setInterval(tick, 500);
     return () => clearInterval(timerRef.current);
-  }, [gameState?.turnStartTime, gameState?.phase, screen, isHost]);
+  }, [gameState?.turnStartTime, gameState?.phase, screen]);
 
   // ─── AUTH FUNCTIONS ────────────────────────────────────────────────────────
   const handleRegister = async () => {
@@ -354,24 +398,31 @@ export default function GizliSayiOyunu() {
   };
 
   const clickNumber = async (num) => {
-    if (gameState.turnOrder[gameState.turnIndex] !== authUser.uid) return;
-    const allSecretsSnap = await getDocs(collection(db, `rooms/${myRoomId}/secrets`));
+    // Snapshot all refs at call time — immune to stale closures during awaits
+    const gs = gameStateRef.current;
+    const pl = playersRef.current;
+    const rid = myRoomIdRef.current;
+    const uid_me = authUserRef.current?.uid;
+    if (!gs || !pl.length || !rid || !uid_me) return;
+    if (!gs.turnOrder || gs.turnOrder[gs.turnIndex] !== uid_me) return;
+
+    const allSecretsSnap = await getDocs(collection(db, `rooms/${rid}/secrets`));
     const secretsMap = {};
     allSecretsSnap.forEach(s => (secretsMap[s.id] = s.data().number));
 
     let foundAny = false, foundNames = [];
-    let newFoundPlayers = [...gameState.foundPlayers];
-    let newPlayers = [...players];
+    let newFoundPlayers = [...(gs.foundPlayers || [])];
+    let newPlayers = [...pl];
 
-    for (const player of players) {
+    for (const player of pl) {
       if (newFoundPlayers.includes(player.id)) continue;
       if (secretsMap[player.id] === num) {
         foundAny = true;
         foundNames.push(player.name);
         newFoundPlayers.push(player.id);
-        const earned = Math.round(BASE_POINTS * Math.pow(SCORE_RATIO, gameState.foundPlayers.length));
+        const earned = Math.round(BASE_POINTS * Math.pow(SCORE_RATIO, gs.foundPlayers.length));
         newPlayers = newPlayers.map(p => p.id === player.id ? { ...p, score: p.score + earned } : p);
-        newPlayers = newPlayers.map(p => p.id === authUser.uid ? { ...p, score: p.score + FINDER_PENALTY } : p);
+        newPlayers = newPlayers.map(p => p.id === uid_me ? { ...p, score: p.score + FINDER_PENALTY } : p);
         addTicker(player.name, `+${earned}`, '#22d3ee');
         addTicker(userProfile.nickname, `${FINDER_PENALTY}`, '#f87171');
       }
@@ -382,15 +433,16 @@ export default function GizliSayiOyunu() {
       setTimeout(() => setCelebration(null), 3000);
     }
 
+    const clickedSoFar = [...(gs.clickedNumbers || []), num];
     const unclicked = Array.from({ length: currentRoom.maxNumber }, (_, i) => i + 1)
-      .filter(n => !([...gameState.clickedNumbers, num].includes(n)));
+      .filter(n => !clickedSoFar.includes(n));
 
-    let nextIdx = (gameState.turnIndex + 1) % gameState.turnOrder.length;
+    let nextIdx = (gs.turnIndex + 1) % gs.turnOrder.length;
     let safety = 0;
-    while (newFoundPlayers.includes(gameState.turnOrder[nextIdx]) && safety++ < players.length) {
-      nextIdx = (nextIdx + 1) % gameState.turnOrder.length;
+    while (newFoundPlayers.includes(gs.turnOrder[nextIdx]) && safety++ < pl.length) {
+      nextIdx = (nextIdx + 1) % gs.turnOrder.length;
     }
-    const nextPlayerId = gameState.turnOrder[nextIdx];
+    const nextPlayerId = gs.turnOrder[nextIdx];
 
     let isDeadlock = false;
     if (unclicked.length === 1 && unclicked[0] === secretsMap[nextPlayerId]) {
@@ -399,9 +451,9 @@ export default function GizliSayiOyunu() {
       newPlayers = newPlayers.map(p => p.id === nextPlayerId ? { ...p, score: p.score + bonus } : p);
     }
 
-    const isEnd = newFoundPlayers.length >= players.length - 1 || isDeadlock;
-    await updateDoc(doc(db, 'rooms', myRoomId), {
-      'gameState.clickedNumbers': [...gameState.clickedNumbers, num],
+    const isEnd = newFoundPlayers.length >= pl.length - 1 || isDeadlock;
+    await updateDoc(doc(db, 'rooms', rid), {
+      'gameState.clickedNumbers': clickedSoFar,
       'gameState.foundPlayers': newFoundPlayers,
       'gameState.turnIndex': nextIdx,
       'gameState.turnStartTime': Date.now(),
@@ -411,14 +463,18 @@ export default function GizliSayiOyunu() {
   };
 
   const applyTimeoutPenalty = async () => {
-    if (!gameState || !players.length) return;
-    const curId = gameState.turnOrder[gameState.turnIndex];
-    const newP = players.map(p => p.id === curId ? { ...p, score: p.score - 20 } : p);
-    let nextIdx = (gameState.turnIndex + 1) % gameState.turnOrder.length;
+    // Use refs — guaranteed fresh values, no stale closure
+    const gs = gameStateRef.current;
+    const pl = playersRef.current;
+    const rid = myRoomIdRef.current;
+    if (!gs || !pl.length || !rid) return;
+    const curId = gs.turnOrder[gs.turnIndex];
+    const newP = pl.map(p => p.id === curId ? { ...p, score: p.score - 20 } : p);
+    let nextIdx = (gs.turnIndex + 1) % gs.turnOrder.length;
     let s = 0;
-    while (gameState.foundPlayers.includes(gameState.turnOrder[nextIdx]) && s++ < players.length)
-      nextIdx = (nextIdx + 1) % gameState.turnOrder.length;
-    await updateDoc(doc(db, 'rooms', myRoomId), {
+    while (gs.foundPlayers.includes(gs.turnOrder[nextIdx]) && s++ < pl.length)
+      nextIdx = (nextIdx + 1) % gs.turnOrder.length;
+    await updateDoc(doc(db, 'rooms', rid), {
       players: newP, 'gameState.turnIndex': nextIdx, 'gameState.turnStartTime': Date.now()
     });
     timerLockRef.current = false;
